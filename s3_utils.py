@@ -50,104 +50,114 @@ class S3Manager:
             logger.error(f"Failed to initialize S3 client: {str(e)}")
             raise
 
+    def get_user_folder(self, user_email):
+        """Generate a folder path for the user's notes"""
+        # Sanitize email to create a valid folder name
+        import re
+        safe_email = re.sub(r'[^a-zA-Z0-9@._-]', '_', user_email)
+        return f"{self.notes_folder}{safe_email}/"
+
     def upload_note(self, note_data):
-        """Upload a single note to S3"""
+        """Upload a note to S3 in the user's folder"""
         try:
-            note_id = str(note_data.get('id', datetime.utcnow().timestamp()))
-            file_key = f"{self.notes_folder}{note_id}.json"
+            note_id = str(note_data.get('id'))
+            user_email = note_data.get('user_email')
+            if not user_email:
+                raise ValueError("Note data must include user_email")
+                
+            file_key = f"{self.get_user_folder(user_email)}{note_id}.json"
             
-            logger.info(f"Uploading note to S3 - ID: {note_id}, Title: {note_data.get('title', 'Untitled')}")
+            logger.info(f"Preparing to upload note. ID: {note_id}, Data: {note_data}")
             
-            self.s3_client.put_object(
+            # Ensure all values are JSON serializable
+            serializable_data = {}
+            for k, v in note_data.items():
+                try:
+                    json.dumps({k: v})  # Test serialization
+                    serializable_data[k] = v
+                except (TypeError, OverflowError) as e:
+                    logger.warning(f"Non-serializable data in note {note_id}, field {k}: {str(e)}")
+                    serializable_data[k] = str(v)
+            
+            # Convert note data to JSON string
+            note_json = json.dumps(serializable_data, indent=2)
+            
+            logger.info(f"Uploading note {note_id} to S3 bucket {self.bucket_name}, key: {file_key}")
+            
+            # Upload to S3
+            response = self.s3_client.put_object(
                 Bucket=self.bucket_name,
                 Key=file_key,
-                Body=json.dumps(note_data, indent=2),
+                Body=note_json,
                 ContentType='application/json'
             )
             
-            logger.info(f"Successfully uploaded note to S3 - ID: {note_id}")
+            logger.info(f"Successfully uploaded note {note_id} to S3. Response: {response}")
             return True
-        except (NoCredentialsError, ClientError) as e:
-            logger.error(f"Error uploading note to S3: {str(e)}")
+            
+        except Exception as e:
+            logger.error(f"Error uploading note to S3: {str(e)}", exc_info=True)
             return False
 
-    def get_all_notes(self):
-        """Retrieve all notes from S3"""
+    def get_user_notes(self, user_email):
+        """Get all notes for a specific user from S3"""
         try:
-            if not self.bucket_name:
-                logger.error("Bucket name is not set")
-                return []
-
-            logger.info(f"Listing objects in bucket: {self.bucket_name}, folder: {self.notes_folder}")
-            
+            user_folder = self.get_user_folder(user_email)
+            logger.info(f"Fetching notes for user {user_email} from S3 folder: {user_folder}")
             notes = []
-            try:
-                paginator = self.s3_client.get_paginator('list_objects_v2')
-                
-                for page in paginator.paginate(Bucket=self.bucket_name, Prefix=self.notes_folder):
-                    if 'Contents' not in page:
-                        logger.info("No notes found in the bucket")
-                        return []
-                        
-                    for obj in page['Contents']:
-                        if not obj['Key'].endswith('/'):  # Skip directories
-                            try:
-                                response = self.s3_client.get_object(
-                                    Bucket=self.bucket_name,
-                                    Key=obj['Key']
-                                )
-                                note_data = json.loads(response['Body'].read().decode('utf-8'))
-                                notes.append(note_data)
-                                logger.debug(f"Successfully retrieved note: {obj['Key']}")
-                            except (ClientError, json.JSONDecodeError) as e:
-                                logger.error(f"Error processing note {obj['Key']}: {str(e)}")
-                                continue
-                
-                logger.info(f"Successfully retrieved {len(notes)} notes")
-                return sorted(notes, key=lambda x: x.get('createdAt', ''), reverse=True)
-                
-            except ClientError as e:
-                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-                error_message = e.response.get('Error', {}).get('Message', 'Unknown error')
-                logger.error(f"AWS Error - Code: {error_code}, Message: {error_message}")
-                return []
-                
-        except Exception as e:
-            logger.error(f"Unexpected error in get_all_notes: {str(e)}", exc_info=True)
-            return []
-
-    def delete_note(self, note_id):
-        """Delete a note from S3"""
-        try:
-            if not self.bucket_name:
-                logger.error("Bucket name is not set")
-                return False
-                
-            if not note_id:
-                logger.error("No note ID provided for deletion")
-                return False
-                
-            file_key = f"{self.notes_folder}{note_id}.json"
-            logger.info(f"Deleting note from S3 - ID: {note_id}")
             
             try:
-                self.s3_client.delete_object(
-                    Bucket=self.bucket_name,
-                    Key=file_key
-                )
+                # List all objects in the user's folder
+                paginator = self.s3_client.get_paginator('list_objects_v2')
+                for page in paginator.paginate(Bucket=self.bucket_name, Prefix=user_folder):
+                    logger.debug(f"Processing S3 page: {page}")
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            if obj['Key'].endswith('.json'):  # Only process JSON files
+                                try:
+                                    logger.debug(f"Processing S3 object: {obj['Key']}")
+                                    # Get the object
+                                    response = self.s3_client.get_object(Bucket=self.bucket_name, Key=obj['Key'])
+                                    note_data = json.loads(response['Body'].read().decode('utf-8'))
+                                    logger.debug(f"Successfully loaded note: {note_data.get('id')}")
+                                    notes.append(note_data)
+                                except Exception as e:
+                                    logger.error(f"Error processing {obj['Key']}: {str(e)}", exc_info=True)
+                                    continue
+                    else:
+                        logger.warning(f"No contents found in user folder: {user_folder}")
+                        break  # No need to continue pagination if no contents found
+                        
+            except self.s3_client.exceptions.NoSuchKey:
+                logger.info(f"No folder found for user {user_email}, returning empty list")
+                return []
+            except Exception as e:
+                logger.error(f"Error listing objects in S3: {str(e)}", exc_info=True)
+                return []
                 
-                logger.info(f"Successfully deleted note from S3 - ID: {note_id}")
-                return True
-                
-            except ClientError as e:
-                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-                error_message = e.response.get('Error', {}).get('Message', 'Unknown error')
-                if error_code == 'NoSuchKey':
-                    logger.warning(f"Note not found in S3 - ID: {note_id}")
-                else:
-                    logger.error(f"Failed to delete note from S3 - Code: {error_code}, Message: {error_message}")
-                return False
-                
+            logger.info(f"Successfully retrieved {len(notes)} notes for user {user_email}")
+            return notes
+            
+        except Exception as e:
+            logger.error(f"Error in get_user_notes: {str(e)}", exc_info=True)
+            return []
+            
+    # Keep the old get_all_notes for admin purposes, but mark as deprecated
+    def get_all_notes(self):
+        """[Deprecated] Get all notes from S3 (use get_user_notes instead)"""
+        logger.warning("get_all_notes() is deprecated. Use get_user_notes(user_email) instead.")
+        return []
+
+    def delete_note(self, note_id, user_email):
+        """Delete a note from user's S3 folder"""
+        try:
+            file_key = f"{self.get_user_folder(user_email)}{note_id}.json"
+            response = self.s3_client.delete_object(
+                Bucket=self.bucket_name,
+                Key=file_key
+            )
+            logger.info(f"Successfully deleted note {note_id} for user {user_email}")
+            return True
         except Exception as e:
             logger.error(f"Unexpected error in delete_note: {str(e)}", exc_info=True)
             return False

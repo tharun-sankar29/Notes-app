@@ -1,3 +1,8 @@
 flask
 flask-cors
 gunicorn
+boto3
+python-dotenv
+flask-login
+email-validator
+werkzeug
